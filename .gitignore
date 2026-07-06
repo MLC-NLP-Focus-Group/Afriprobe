@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local config
+.venv/
+venv/
+.env
+.env.*
+
+# Hugging Face / ML caches
+.cache/
+hf_cache/
+*.safetensors
+
+# Local datasets and cloned corpora
+data/
+masakhane-pos/
+datasets/masakhane-pos/
+
+# Experiment outputs
+outputs/
+hidden_states/
+probes/*/source_*/
+probes/*/*_to_*/
+
+# Large model/probe artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Archives created for download/backup
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.part-*
+
+# OS/editor noise
+.DS_Store
+.vscode/

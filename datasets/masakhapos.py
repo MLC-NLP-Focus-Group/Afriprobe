@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 import torch
 from datasets import ClassLabel, Sequence, load_dataset
@@ -11,8 +14,34 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 IGNORE_INDEX = -100
 DEFAULT_DATASET_NAME = "masakhapos"
+DEFAULT_GITHUB_REPO = "https://raw.githubusercontent.com/masakhane-io/masakhane-pos"
 TOKEN_FIELDS = ("tokens", "words", "word")
 LABEL_FIELDS = ("labels", "pos_tags", "upos", "upos_tags", "tags")
+UPOS_LABELS = [
+    "ADJ",
+    "ADP",
+    "ADV",
+    "AUX",
+    "CCONJ",
+    "DET",
+    "INTJ",
+    "NOUN",
+    "NUM",
+    "PART",
+    "PRON",
+    "PROPN",
+    "PUNCT",
+    "SCONJ",
+    "SYM",
+    "VERB",
+    "X",
+]
+SPLIT_ALIASES = {
+    "train": ("train",),
+    "validation": ("validation", "dev", "valid", "val"),
+    "dev": ("dev", "validation", "valid", "val"),
+    "test": ("test",),
+}
 
 
 @dataclass(frozen=True)
@@ -20,6 +49,21 @@ class LabelInfo:
     field_name: str
     label_list: list[str]
     label_to_id: dict[str, int] | None
+
+
+class SimpleMasakhaPOSCorpus:
+    def __init__(self, examples: list[dict[str, list[Any]]], label_list: list[str]) -> None:
+        self.examples = examples
+        self.features = {
+            "tokens": None,
+            "labels": Sequence(ClassLabel(names=label_list)),
+        }
+
+    def __iter__(self):
+        return iter(self.examples)
+
+    def __len__(self) -> int:
+        return len(self.examples)
 
 
 def _find_existing_field(features: Any, candidates: tuple[str, ...], kind: str) -> str:
@@ -73,6 +117,152 @@ def _build_label_info(dataset: Any, label_field: str) -> LabelInfo:
     raise ValueError(f"Unsupported label values in field '{label_field}': {sorted(type(x).__name__ for x in observed)}")
 
 
+def _normalise_split_names(split: str) -> tuple[str, ...]:
+    return SPLIT_ALIASES.get(split, (split,))
+
+
+def _github_candidate_urls(github_repo: str, language: str, split: str) -> list[str]:
+    split_names = _normalise_split_names(split)
+    extensions = ("txt", "tsv", "conll", "conllu")
+    branches = ("main", "master")
+    templates = (
+        "data/{language}/{split}.{extension}",
+        "data/{language}/{language}_{split}.{extension}",
+        "data/{language}/{language}-{split}.{extension}",
+        "data/{language}_{split}.{extension}",
+        "data/{language}-{split}.{extension}",
+        "data/{split}/{language}.{extension}",
+        "data/{split}/{language}_{split}.{extension}",
+    )
+
+    urls = []
+    for branch in branches:
+        for split_name in split_names:
+            for template in templates:
+                for extension in extensions:
+                    path = template.format(language=language, split=split_name, extension=extension)
+                    urls.append(f"{github_repo.rstrip('/')}/{branch}/{path}")
+    return urls
+
+
+def _read_url(url: str) -> str:
+    with urlopen(url, timeout=30) as response:
+        return response.read().decode("utf-8")
+
+
+def _read_local_file(path: Path) -> str:
+    with path.open("r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _parse_pos_text(text: str) -> tuple[list[dict[str, list[Any]]], list[str]]:
+    examples = []
+    tokens = []
+    labels = []
+    label_set = set()
+
+    def flush_sentence() -> None:
+        nonlocal tokens, labels
+        if tokens:
+            examples.append({"tokens": tokens, "labels": labels})
+            tokens = []
+            labels = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush_sentence()
+            continue
+        if line.startswith("#"):
+            continue
+
+        fields = line.split("\t") if "\t" in line else line.split()
+        if len(fields) < 2:
+            continue
+
+        if len(fields) >= 4 and fields[0].replace(".", "", 1).replace("-", "", 1).isdigit():
+            token_id = fields[0]
+            if "-" in token_id or "." in token_id:
+                continue
+            token = fields[1]
+            label = fields[3]
+        else:
+            token = fields[0]
+            label = fields[-1]
+
+        tokens.append(token)
+        labels.append(label)
+        label_set.add(label)
+
+    flush_sentence()
+
+    if not examples:
+        raise ValueError("No POS-tagged sentences could be parsed from the dataset file.")
+
+    if label_set.issubset(set(UPOS_LABELS)):
+        label_list = UPOS_LABELS
+    else:
+        label_list = sorted(label_set)
+    label_to_id = {label: index for index, label in enumerate(label_list)}
+    for example in examples:
+        example["labels"] = [label_to_id[label] for label in example["labels"]]
+
+    return examples, label_list
+
+
+def _load_github_dataset(github_repo: str, language: str, split: str) -> SimpleMasakhaPOSCorpus:
+    errors = []
+    for url in _github_candidate_urls(github_repo, language, split):
+        try:
+            text = _read_url(url)
+            examples, label_list = _parse_pos_text(text)
+            print(f"[dataset] loaded MasakhaPOS from {url}")
+            return SimpleMasakhaPOSCorpus(examples=examples, label_list=label_list)
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            errors.append(f"{url}: {exc}")
+
+    preview = "\n".join(errors[:8])
+    raise RuntimeError(
+        "Could not load MasakhaPOS from Hugging Face or the GitHub fallback. "
+        "Tried raw GitHub candidate paths such as:\n"
+        f"{preview}"
+    )
+
+
+def _load_local_dataset(data_dir: Path, language: str, split: str) -> SimpleMasakhaPOSCorpus:
+    split_names = _normalise_split_names(split)
+    candidates = []
+    for split_name in split_names:
+        candidates.extend(
+            [
+                data_dir / language / f"{split_name}.txt",
+                data_dir / language / f"{split_name}.tsv",
+                data_dir / language / f"{split_name}.conll",
+                data_dir / language / f"{split_name}.conllu",
+                data_dir / language / f"{language}_{split_name}.txt",
+                data_dir / language / f"{language}_{split_name}.tsv",
+                data_dir / f"{language}_{split_name}.txt",
+                data_dir / f"{language}_{split_name}.tsv",
+            ]
+        )
+
+    allowed_suffixes = {".txt", ".tsv", ".conll", ".conllu"}
+    for path in data_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in allowed_suffixes:
+            continue
+        path_text = str(path).lower()
+        if language.lower() in path_text and any(split_name.lower() in path_text for split_name in split_names):
+            candidates.append(path)
+
+    for path in candidates:
+        if path.exists():
+            examples, label_list = _parse_pos_text(_read_local_file(path))
+            print(f"[dataset] loaded MasakhaPOS from {path}")
+            return SimpleMasakhaPOSCorpus(examples=examples, label_list=label_list)
+
+    raise FileNotFoundError(f"No local MasakhaPOS file found under {data_dir} for {language}/{split}.")
+
+
 class MasakhaPOSDataset(Dataset):
     """MasakhaPOS token-classification dataset with word-to-subword label alignment."""
 
@@ -83,6 +273,8 @@ class MasakhaPOSDataset(Dataset):
         split: str = "train",
         max_length: int = 256,
         dataset_name: str = DEFAULT_DATASET_NAME,
+        github_repo: str = DEFAULT_GITHUB_REPO,
+        data_dir: str | None = None,
         ignore_index: int = IGNORE_INDEX,
         tokenizer: PreTrainedTokenizerBase | None = None,
     ) -> None:
@@ -92,17 +284,14 @@ class MasakhaPOSDataset(Dataset):
 
         self.tokenizer_name_or_path = tokenizer_name_or_path
         self.dataset_name = dataset_name
+        self.github_repo = github_repo
+        self.data_dir = data_dir
         self.language = language
         self.split = split
         self.max_length = max_length
         self.ignore_index = ignore_index
 
-        try:
-            self.raw_dataset = load_dataset(dataset_name, language, split=split)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to load dataset='{dataset_name}', language='{language}', split='{split}'."
-            ) from exc
+        self.raw_dataset = self._load_raw_dataset()
 
         self.token_field = _find_existing_field(self.raw_dataset.features, TOKEN_FIELDS, "token")
         self.label_field = _find_existing_field(self.raw_dataset.features, LABEL_FIELDS, "POS label")
@@ -110,6 +299,27 @@ class MasakhaPOSDataset(Dataset):
         self.label_list = self.label_info.label_list
         self.num_labels = len(self.label_list)
         self.samples = [self._encode_example(example) for example in self.raw_dataset]
+
+    def _load_raw_dataset(self) -> Any:
+        if self.data_dir is not None:
+            return _load_local_dataset(Path(self.data_dir), self.language, self.split)
+
+        if self.dataset_name in {"github", "masakhane-github"}:
+            return _load_github_dataset(self.github_repo, self.language, self.split)
+
+        try:
+            return load_dataset(self.dataset_name, self.language, split=self.split)
+        except Exception as exc:
+            if self.dataset_name not in {"auto", DEFAULT_DATASET_NAME}:
+                raise RuntimeError(
+                    f"Failed to load dataset='{self.dataset_name}', language='{self.language}', split='{self.split}'."
+                ) from exc
+
+            print(
+                f"[dataset] Hugging Face dataset '{self.dataset_name}' was not available for "
+                f"{self.language}/{self.split}; trying official GitHub fallback."
+            )
+            return _load_github_dataset(self.github_repo, self.language, self.split)
 
     def _normalise_labels(self, labels: list[Any]) -> list[int]:
         if self.label_info.label_to_id is None:

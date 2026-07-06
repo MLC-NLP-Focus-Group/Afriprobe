@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -19,6 +20,18 @@ sys.path.insert(0, str(DATASET_DIR))
 from masakhapos import MasakhaPOSDataset  # noqa: E402
 
 
+def validate_dataset_import() -> None:
+    signature = inspect.signature(MasakhaPOSDataset.__init__)
+    if "tokenizer_name_or_path" not in signature.parameters:
+        module_path = inspect.getfile(MasakhaPOSDataset)
+        raise RuntimeError(
+            "Imported an incompatible MasakhaPOSDataset. "
+            f"Loaded from: {module_path}. "
+            "Expected datasets/masakhapos.py with a tokenizer_name_or_path argument. "
+            "Delete stale duplicate dataset files and rerun."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract frozen encoder hidden states for MasakhaPOS.")
     parser.add_argument("--model_name_or_path", required=True)
@@ -30,6 +43,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default="outputs/hidden_states")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dataset_name", default="masakhapos")
+    parser.add_argument("--data_dir", default=None)
+    parser.add_argument("--github_repo", default="https://raw.githubusercontent.com/masakhane-io/masakhane-pos")
+    parser.add_argument("--save_dtype", choices=["float16", "float32"], default="float16")
+    parser.add_argument("--layers", nargs="+", default=None, help="Layer indices to save. Defaults to all layers.")
+    parser.add_argument("--overwrite", action="store_true", help="Re-extract splits even when a manifest already exists.")
     return parser.parse_args()
 
 
@@ -57,6 +75,39 @@ def save_manifest(split_dir: Path, manifest: dict[str, Any]) -> None:
         json.dump(manifest, handle, indent=2)
 
 
+def completed_split_exists(split_dir: Path) -> bool:
+    manifest_path = split_dir / "manifest.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except json.JSONDecodeError:
+        return False
+    chunks = manifest.get("chunks", [])
+    return bool(chunks) and all((split_dir / chunk["file"]).exists() for chunk in chunks)
+
+
+def parse_layer_indices(layer_args: list[str] | None) -> list[int] | None:
+    if layer_args is None:
+        return None
+    layers: list[int] = []
+    for layer_arg in layer_args:
+        for part in layer_arg.split(","):
+            part = part.strip()
+            if part:
+                layers.append(int(part))
+    return layers
+
+
+def resolve_save_dtype(save_dtype: str) -> torch.dtype:
+    if save_dtype == "float16":
+        return torch.float16
+    if save_dtype == "float32":
+        return torch.float32
+    raise ValueError(f"Unsupported save_dtype: {save_dtype}")
+
+
 def extract_split(
     model: torch.nn.Module,
     tokenizer: Any,
@@ -69,7 +120,17 @@ def extract_split(
     output_dir: Path,
     device: torch.device,
     dataset_name: str,
+    data_dir: str | None,
+    github_repo: str,
+    save_dtype: torch.dtype,
+    layer_indices: list[int] | None,
+    overwrite: bool,
 ) -> None:
+    split_dir = output_dir / model_alias / language / split
+    if not overwrite and completed_split_exists(split_dir):
+        print(f"[extract] skipping completed split: {split_dir}")
+        return
+
     dataset = MasakhaPOSDataset(
         tokenizer_name_or_path=model_name_or_path,
         tokenizer=tokenizer,
@@ -77,18 +138,23 @@ def extract_split(
         split=split,
         max_length=max_length,
         dataset_name=dataset_name,
+        data_dir=data_dir,
+        github_repo=github_repo,
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_examples)
-    split_dir = output_dir / model_alias / language / split
     split_dir.mkdir(parents=True, exist_ok=True)
 
     manifest: dict[str, Any] = {
         "model_name_or_path": model_name_or_path,
         "model_alias": model_alias,
         "dataset_name": dataset_name,
+        "data_dir": data_dir,
+        "github_repo": github_repo,
         "language": language,
         "split": split,
         "max_length": max_length,
+        "save_dtype": str(save_dtype).replace("torch.", ""),
+        "layers": layer_indices if layer_indices is not None else "all",
         "num_examples": len(dataset),
         "label_list": dataset.label_list,
         "chunks": [],
@@ -104,7 +170,10 @@ def extract_split(
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-            hidden_states = torch.stack(outputs.hidden_states, dim=1).cpu()
+            hidden_state_layers = outputs.hidden_states
+            if layer_indices is not None:
+                hidden_state_layers = tuple(hidden_state_layers[layer_index] for layer_index in layer_indices)
+            hidden_states = torch.stack(hidden_state_layers, dim=1).to(dtype=save_dtype).cpu()
             labels = batch["labels"].cpu()
             mask = batch["attention_mask"].cpu()
 
@@ -121,6 +190,8 @@ def extract_split(
                         "language": language,
                         "split": split,
                         "max_length": max_length,
+                        "save_dtype": str(save_dtype).replace("torch.", ""),
+                        "layers": layer_indices if layer_indices is not None else "all",
                         "label_list": dataset.label_list,
                         "tokens": batch["tokens"],
                         "word_ids": batch["word_ids"],
@@ -141,7 +212,7 @@ def extract_split(
             if chunk_index == 0:
                 print(
                     f"[extract] first chunk shape: hidden_states={tuple(hidden_states.shape)}, "
-                    f"labels={tuple(labels.shape)}, attention_mask={tuple(mask.shape)}"
+                    f"labels={tuple(labels.shape)}, attention_mask={tuple(mask.shape)}, dtype={hidden_states.dtype}"
                 )
 
     save_manifest(split_dir, manifest)
@@ -149,9 +220,12 @@ def extract_split(
 
 
 def main() -> None:
+    validate_dataset_import()
     args = parse_args()
     device = resolve_device(args.device)
     output_dir = Path(args.output_dir)
+    save_dtype = resolve_save_dtype(args.save_dtype)
+    layer_indices = parse_layer_indices(args.layers)
 
     print(f"[extract] loading tokenizer/model: {args.model_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
@@ -176,6 +250,11 @@ def main() -> None:
                     output_dir=output_dir,
                     device=device,
                     dataset_name=args.dataset_name,
+                    data_dir=args.data_dir,
+                    github_repo=args.github_repo,
+                    save_dtype=save_dtype,
+                    layer_indices=layer_indices,
+                    overwrite=args.overwrite,
                 )
             except Exception as exc:
                 raise RuntimeError(f"Failed while extracting {language}/{split}.") from exc

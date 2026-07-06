@@ -73,13 +73,24 @@ def load_manifest(path: Path) -> dict[str, Any]:
 def validate_layer(chunk: dict[str, Any], layer: int, chunk_path: Path) -> None:
     hidden_states = chunk["hidden_states"]
     num_layers = hidden_states.shape[1]
-    if layer < 0 or layer >= num_layers:
+    layer_slot = resolve_layer_slot(chunk, layer)
+    if layer_slot < 0 or layer_slot >= num_layers:
         raise ValueError(f"Requested layer {layer}, but {chunk_path} has layers 0..{num_layers - 1}.")
+
+
+def resolve_layer_slot(chunk: dict[str, Any], layer: int) -> int:
+    saved_layers = chunk.get("metadata", {}).get("layers", "all")
+    if saved_layers == "all":
+        return layer
+    if layer in saved_layers:
+        return saved_layers.index(layer)
+    raise ValueError(f"Requested original layer {layer}, but this chunk contains layers: {saved_layers}")
 
 
 def flatten_valid_tokens(chunk: dict[str, Any], layer: int) -> tuple[torch.Tensor, torch.Tensor]:
     validate_layer(chunk, layer, Path("<memory>"))
-    hidden_states = chunk["hidden_states"][:, layer, :, :]
+    layer_slot = resolve_layer_slot(chunk, layer)
+    hidden_states = chunk["hidden_states"][:, layer_slot, :, :]
     labels = chunk["labels"]
     valid_positions = labels != IGNORE_INDEX
     return hidden_states[valid_positions].float(), labels[valid_positions].long()
