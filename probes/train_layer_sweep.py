@@ -11,6 +11,8 @@ from train_probe import (
     LinearProbe,
     chunk_files,
     evaluate,
+    flatten_valid_tokens,
+    load_cached_training_tokens,
     load_manifest,
     load_training_tokens,
     resolve_device,
@@ -35,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default="outputs/probes")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--cache_dir", default=None, help="Optional directory for cached flattened train matrices.")
+    parser.add_argument("--overwrite_cache", action="store_true")
     return parser.parse_args()
 
 
@@ -105,6 +109,69 @@ def save_summary(summary_path: Path, summary: dict[str, Any]) -> None:
         json.dump(summary, handle, indent=2)
 
 
+def training_cache_path(
+    cache_dir: Path,
+    model_alias: str,
+    source_language: str,
+    train_split: str,
+    layer: int,
+) -> Path:
+    return cache_dir / model_alias / source_language / train_split / f"layer_{layer}.pt"
+
+
+def build_training_cache(
+    files: list[Path],
+    layers: list[int],
+    cache_dir: Path,
+    model_alias: str,
+    source_language: str,
+    train_split: str,
+    overwrite_cache: bool,
+) -> dict[int, Path]:
+    cache_paths = {
+        layer: training_cache_path(cache_dir, model_alias, source_language, train_split, layer)
+        for layer in layers
+    }
+    missing_layers = [
+        layer for layer, cache_path in cache_paths.items() if overwrite_cache or not cache_path.exists()
+    ]
+
+    if not missing_layers:
+        print(f"[sweep] using cached train matrices from {cache_dir}")
+        return cache_paths
+
+    print(f"[sweep] building train cache for layers={missing_layers}")
+    hidden_parts_by_layer: dict[int, list[torch.Tensor]] = {layer: [] for layer in missing_layers}
+    label_parts_by_layer: dict[int, list[torch.Tensor]] = {layer: [] for layer in missing_layers}
+
+    for file_path in files:
+        chunk = torch.load(file_path, map_location="cpu")
+        for layer in missing_layers:
+            hidden, labels = flatten_valid_tokens(chunk, layer)
+            hidden_parts_by_layer[layer].append(hidden)
+            label_parts_by_layer[layer].append(labels)
+
+    for layer in missing_layers:
+        hidden = torch.cat(hidden_parts_by_layer[layer], dim=0)
+        labels = torch.cat(label_parts_by_layer[layer], dim=0)
+        cache_path = cache_paths[layer]
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "hidden": hidden,
+                "labels": labels,
+                "layer": layer,
+                "model_alias": model_alias,
+                "source_language": source_language,
+                "train_split": train_split,
+            },
+            cache_path,
+        )
+        print(f"[sweep] cached layer {layer}: hidden={tuple(hidden.shape)} -> {cache_path}")
+
+    return cache_paths
+
+
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
@@ -122,6 +189,17 @@ def main() -> None:
     label_list = train_manifest["label_list"]
     num_labels = len(label_list)
     layers = parse_layer_args(args.layers, train_files)
+    cache_paths = None
+    if args.cache_dir is not None:
+        cache_paths = build_training_cache(
+            files=train_files,
+            layers=layers,
+            cache_dir=Path(args.cache_dir),
+            model_alias=args.model_alias,
+            source_language=args.source_language,
+            train_split=args.train_split,
+            overwrite_cache=args.overwrite_cache,
+        )
     eval_sets = load_eval_sets(
         hidden_dir=hidden_dir,
         model_alias=args.model_alias,
@@ -161,7 +239,10 @@ def main() -> None:
             continue
 
         print(f"[sweep] training layer {layer}")
-        hidden, labels = load_training_tokens(train_files, layer)
+        if cache_paths is None:
+            hidden, labels = load_training_tokens(train_files, layer)
+        else:
+            hidden, labels = load_cached_training_tokens(cache_paths[layer])
         hidden_dim = hidden.shape[-1]
         probe, train_history = train_probe(
             hidden=hidden,

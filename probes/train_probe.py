@@ -115,6 +115,17 @@ def load_training_tokens(files: list[Path], layer: int) -> tuple[torch.Tensor, t
     return hidden, labels
 
 
+def load_cached_training_tokens(cache_path: Path) -> tuple[torch.Tensor, torch.Tensor]:
+    cache = torch.load(cache_path, map_location="cpu")
+    hidden = cache["hidden"]
+    labels = cache["labels"]
+    print(
+        f"[probe] cached train matrix: hidden={tuple(hidden.shape)}, "
+        f"labels={tuple(labels.shape)} from {cache_path}"
+    )
+    return hidden, labels
+
+
 def macro_f1_from_counts(predictions: torch.Tensor, labels: torch.Tensor, num_labels: int) -> float:
     f1_scores = []
     for label_id in range(num_labels):
