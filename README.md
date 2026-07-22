@@ -20,7 +20,8 @@ extract/hidden_states.py        # Frozen encoder hidden-state extraction
 probes/train_probe.py           # Single-layer linear probe training/evaluation
 probes/train_layer_sweep.py     # Train/evaluate probes across all layers
 analysis/cka.py                 # Pairwise representation alignment with linear CKA
-analysis/plot_probe_results.py  # SVG plots from summarized probe CSV files
+analysis/summarize_probe_results.py  # Convert layer_sweep_metrics.json files to CSV summaries
+analysis/plot_probe_results.py       # SVG plots from summarized probe CSV files
 ```
 
 ## 1. Set Up Python
@@ -76,7 +77,8 @@ export HF_DATASETS_CACHE=/workspace/afriprobe_cache/hf/datasets
 export PIP_CACHE_DIR=/workspace/afriprobe_cache/pip
 export TMPDIR=/workspace/afriprobe_cache/tmp
 ```
-If you are not on runpod find the largest disk space on your machine and store the checkpoints and hidden states there. You can use ``` df -h ``` on linux to find the space 
+
+Optional: add those exports to `~/.bashrc` so future terminals use `/workspace` automatically.
 
 ## 3. Download MasakhaPOS
 
@@ -315,7 +317,41 @@ CKA outputs are saved under:
 
 Use `--device cpu` if GPU memory is limited. CKA can also be run with fewer tokens, for example `--max_tokens 2000`, for a faster pilot run.
 
-## 7. Generate Probe Plots
+## 7. Summarize Probe Results
+
+After probe training, each source language has a `layer_sweep_metrics.json` file. Convert those JSON files into CSV tables with:
+
+```bash
+python analysis/summarize_probe_results.py \
+  --input_dir /workspace/afriprobe/probes/xlmr \
+  --output_dir analysis/probe_results \
+  --model_alias xlmr \
+  --languages yor ibo hau swa wol
+```
+
+For AfroXLMR:
+
+```bash
+python analysis/summarize_probe_results.py \
+  --input_dir /workspace/afriprobe/probes/afro-xlmr-large \
+  --output_dir analysis/probe_results_afro_xlmr_large \
+  --model_alias afro-xlmr-large \
+  --languages yor ibo hau swa wol
+```
+
+Expected CSV outputs:
+
+```text
+probe_transfer_long.csv
+best_layer_by_pair.csv
+best_accuracy_transfer_matrix.csv
+best_macro_f1_transfer_matrix.csv
+layer_average_summary.csv
+source_summary.csv
+target_summary.csv
+```
+
+## 8. Generate Probe Plots
 
 If you have summarized probe CSVs in `analysis/probe_results`, generate SVG figures with:
 
@@ -336,16 +372,17 @@ layer_macro_f1_curve.svg
 top_cross_lingual_pairs.svg
 ```
 
-## 8. Suggested Experiment Workflow
+## 9. Suggested Experiment Workflow
 
 Recommended order:
 
 1. Download MasakhaPOS.
 2. Extract hidden states for all languages and splits.
 3. Train layer-wise probes for each source language.
-4. Compare in-language and cross-lingual transfer.
-5. Compute CKA for each language pair and layer.
-6. Compare CKA scores against cross-lingual probe accuracy or macro F1.
+4. Summarize `layer_sweep_metrics.json` files into CSVs.
+5. Generate probe plots.
+6. Compute CKA for each language pair and layer.
+7. Compare CKA scores against cross-lingual probe accuracy or macro F1.
 
 For one model and five languages:
 
@@ -354,7 +391,7 @@ For one model and five languages:
 each probe evaluated on 5 target languages = source-target transfer matrix
 ```
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 ### `No module named 'datasets'`
 
